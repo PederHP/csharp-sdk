@@ -156,6 +156,41 @@ public sealed class McpServerHandlers
     /// </remarks>
     public McpRequestHandler<SetLevelRequestParams, EmptyResult>? SetLoggingLevelHandler { get; set; }
 
+    /// <summary>
+    /// Gets or sets the handler for <see cref="RequestMethods.InterceptorsList"/> requests.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The handler should return a list of available interceptors when requested by a client.
+    /// It supports pagination through the cursor mechanism, where the client can make
+    /// repeated calls with the cursor returned by the previous call to retrieve more interceptors.
+    /// </para>
+    /// <para>
+    /// This handler works alongside any interceptors defined in the <see cref="McpServerInterceptor"/> collection.
+    /// Interceptors from both sources will be combined when returning results to clients.
+    /// </para>
+    /// </remarks>
+    public McpRequestHandler<ListInterceptorsRequestParams, ListInterceptorsResult>? ListInterceptorsHandler { get; set; }
+
+    /// <summary>
+    /// Gets or sets the handler for <see cref="RequestMethods.InterceptorInvoke"/> requests.
+    /// </summary>
+    /// <remarks>
+    /// This handler is invoked when a client calls an interceptor that isn't found in the <see cref="McpServerInterceptor"/> collection.
+    /// The handler should implement logic to execute the requested interceptor and return appropriate results.
+    /// </remarks>
+    public McpRequestHandler<InvokeInterceptorRequestParams, InvokeInterceptorResult>? InvokeInterceptorHandler { get; set; }
+
+    /// <summary>
+    /// Gets or sets the handler for <see cref="RequestMethods.InterceptorExecuteChain"/> requests.
+    /// </summary>
+    /// <remarks>
+    /// This handler is invoked when a client requests execution of a chain of interceptors.
+    /// The handler should implement logic to execute the interceptors in sequence according to their
+    /// priority and type, and return aggregated results.
+    /// </remarks>
+    public McpRequestHandler<ExecuteChainRequestParams, ExecuteChainResult>? ExecuteChainHandler { get; set; }
+
     /// <summary>Gets or sets notification handlers to register with the server.</summary>
     /// <remarks>
     /// <para>

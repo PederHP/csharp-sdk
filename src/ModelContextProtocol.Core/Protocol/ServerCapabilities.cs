@@ -66,6 +66,12 @@ public sealed class ServerCapabilities
     [JsonPropertyName("completions")]
     public CompletionsCapability? Completions { get; set; }
 
+    /// <summary>
+    /// Gets or sets a server's interceptors capability for providing validation, mutation, and observability interceptors.
+    /// </summary>
+    [JsonPropertyName("interceptors")]
+    public InterceptorsCapability? Interceptors { get; set; }
+
     /// <summary>Gets or sets notification handlers to register with the server.</summary>
     /// <remarks>
     /// <para>

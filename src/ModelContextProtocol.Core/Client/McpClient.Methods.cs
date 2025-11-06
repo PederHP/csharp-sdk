@@ -692,6 +692,94 @@ public abstract partial class McpClient : McpSession, IMcpClient
     public Task SetLoggingLevel(LogLevel level, CancellationToken cancellationToken = default) =>
         SetLoggingLevel(McpServerImpl.ToLoggingLevel(level), cancellationToken);
 
+    /// <summary>
+    /// Retrieves a list of available interceptors from the server.
+    /// </summary>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
+    /// <returns>A list of all available interceptors.</returns>
+    public async ValueTask<IList<Interceptor>> ListInterceptorsAsync(CancellationToken cancellationToken = default)
+    {
+        List<Interceptor>? interceptors = null;
+        string? cursor = null;
+        do
+        {
+            var result = await SendRequestAsync(
+                RequestMethods.InterceptorsList,
+                new ListInterceptorsRequestParams { Cursor = cursor },
+                McpJsonUtilities.JsonContext.Default.ListInterceptorsRequestParams,
+                McpJsonUtilities.JsonContext.Default.ListInterceptorsResult,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            interceptors ??= new List<Interceptor>(result.Interceptors.Length);
+            interceptors.AddRange(result.Interceptors);
+
+            cursor = result.NextCursor;
+        }
+        while (cursor is not null);
+
+        return interceptors;
+    }
+
+    /// <summary>
+    /// Invokes a single interceptor on the server.
+    /// </summary>
+    /// <param name="interceptorId">The unique identifier of the interceptor to invoke.</param>
+    /// <param name="eventName">The event name being intercepted (e.g., "tools/call", "resources/read").</param>
+    /// <param name="phase">The phase at which the interceptor is being invoked (Request or Response).</param>
+    /// <param name="payload">The payload to be processed by the interceptor.</param>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
+    /// <returns>The result from invoking the interceptor.</returns>
+    public ValueTask<InvokeInterceptorResult> InvokeInterceptorAsync(
+        string interceptorId,
+        string eventName,
+        InterceptorPhase phase,
+        JsonElement? payload = null,
+        CancellationToken cancellationToken = default)
+    {
+        return SendRequestAsync(
+            RequestMethods.InterceptorInvoke,
+            new InvokeInterceptorRequestParams
+            {
+                InterceptorId = interceptorId,
+                Event = eventName,
+                Phase = phase,
+                Payload = payload
+            },
+            McpJsonUtilities.JsonContext.Default.InvokeInterceptorRequestParams,
+            McpJsonUtilities.JsonContext.Default.InvokeInterceptorResult,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Executes a chain of interceptors on the server.
+    /// </summary>
+    /// <param name="interceptorIds">The ordered list of interceptor IDs to execute.</param>
+    /// <param name="eventName">The event name being intercepted (e.g., "tools/call", "resources/read").</param>
+    /// <param name="phase">The phase at which the interceptors are being invoked (Request or Response).</param>
+    /// <param name="payload">The initial payload to be processed by the interceptor chain.</param>
+    /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
+    /// <returns>The aggregated result from executing the interceptor chain.</returns>
+    public ValueTask<ExecuteChainResult> ExecuteChainAsync(
+        string[] interceptorIds,
+        string eventName,
+        InterceptorPhase phase,
+        JsonElement? payload = null,
+        CancellationToken cancellationToken = default)
+    {
+        return SendRequestAsync(
+            RequestMethods.InterceptorExecuteChain,
+            new ExecuteChainRequestParams
+            {
+                InterceptorIds = interceptorIds,
+                Event = eventName,
+                Phase = phase,
+                Payload = payload
+            },
+            McpJsonUtilities.JsonContext.Default.ExecuteChainRequestParams,
+            McpJsonUtilities.JsonContext.Default.ExecuteChainResult,
+            cancellationToken: cancellationToken);
+    }
+
     /// <summary>Convers a dictionary with <see cref="object"/> values to a dictionary with <see cref="JsonElement"/> values.</summary>
     private static Dictionary<string, JsonElement>? ToArgumentsDictionary(
         IReadOnlyDictionary<string, object?>? arguments, JsonSerializerOptions options)

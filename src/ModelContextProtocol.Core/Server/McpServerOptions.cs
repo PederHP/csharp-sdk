@@ -143,7 +143,7 @@ public sealed class McpServerOptions
     /// when those are provided:
     /// </para>
     /// <para>
-    /// - For <see cref="RequestMethods.PromptsList"/> requests: The server returns all prompts from this collection 
+    /// - For <see cref="RequestMethods.PromptsList"/> requests: The server returns all prompts from this collection
     ///   plus any additional prompts provided by the <see cref="McpServerHandlers.ListPromptsHandler"/> if it's set.
     /// </para>
     /// <para>
@@ -152,6 +152,26 @@ public sealed class McpServerOptions
     /// </para>
     /// </remarks>
     public McpServerPrimitiveCollection<McpServerPrompt>? PromptCollection { get; set; }
+
+    /// <summary>
+    /// Gets or sets a collection of interceptors that will be served by the server.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The <see cref="InterceptorCollection"/> contains the interceptors that clients can discover and invoke from the server.
+    /// This collection works in conjunction with <see cref="McpServerHandlers.ListInterceptorsHandler"/> and <see cref="McpServerHandlers.InvokeInterceptorHandler"/>
+    /// when those are provided:
+    /// </para>
+    /// <para>
+    /// - For <see cref="RequestMethods.InterceptorsList"/> requests: The server returns all interceptors from this collection
+    ///   plus any additional interceptors provided by the <see cref="McpServerHandlers.ListInterceptorsHandler"/> if it's set.
+    /// </para>
+    /// <para>
+    /// - For <see cref="RequestMethods.InterceptorInvoke"/> requests: The server first checks this collection for the requested interceptor.
+    ///   If not found, it will invoke the <see cref="McpServerHandlers.InvokeInterceptorHandler"/> as a fallback if one is set.
+    /// </para>
+    /// </remarks>
+    public McpServerPrimitiveCollection<McpServerInterceptor>? InterceptorCollection { get; set; }
 
     /// <summary>
     /// Gets or sets the default maximum number of tokens to use for sampling requests when not explicitly specified.

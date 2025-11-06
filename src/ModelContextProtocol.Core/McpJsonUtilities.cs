@@ -100,6 +100,7 @@ public static partial class McpJsonUtilities
     // MCP Notification Params
     [JsonSerializable(typeof(CancelledNotificationParams))]
     [JsonSerializable(typeof(InitializedNotificationParams))]
+    [JsonSerializable(typeof(InterceptorListChangedNotificationParams))]
     [JsonSerializable(typeof(LoggingMessageNotificationParams))]
     [JsonSerializable(typeof(ProgressNotificationParams))]
     [JsonSerializable(typeof(PromptListChangedNotificationParams))]
@@ -118,10 +119,16 @@ public static partial class McpJsonUtilities
     [JsonSerializable(typeof(ElicitRequestParams))]
     [JsonSerializable(typeof(ElicitResult))]
     [JsonSerializable(typeof(EmptyResult))]
+    [JsonSerializable(typeof(ExecuteChainRequestParams))]
+    [JsonSerializable(typeof(ExecuteChainResult))]
     [JsonSerializable(typeof(GetPromptRequestParams))]
     [JsonSerializable(typeof(GetPromptResult))]
     [JsonSerializable(typeof(InitializeRequestParams))]
     [JsonSerializable(typeof(InitializeResult))]
+    [JsonSerializable(typeof(InvokeInterceptorRequestParams))]
+    [JsonSerializable(typeof(InvokeInterceptorResult))]
+    [JsonSerializable(typeof(ListInterceptorsRequestParams))]
+    [JsonSerializable(typeof(ListInterceptorsResult))]
     [JsonSerializable(typeof(ListPromptsRequestParams))]
     [JsonSerializable(typeof(ListPromptsResult))]
     [JsonSerializable(typeof(ListResourcesRequestParams))]
@@ -151,6 +158,13 @@ public static partial class McpJsonUtilities
     [JsonSerializable(typeof(ResourceTemplateReference))]
     [JsonSerializable(typeof(BlobResourceContents))]
     [JsonSerializable(typeof(TextResourceContents))]
+
+    // MCP Interceptor Types
+    [JsonSerializable(typeof(Interceptor))]
+    [JsonSerializable(typeof(InterceptorType))]
+    [JsonSerializable(typeof(InterceptorPhase))]
+    [JsonSerializable(typeof(ValidationResult))]
+    [JsonSerializable(typeof(ValidationSeverity))]
 
     // Other MCP Types
     [JsonSerializable(typeof(IReadOnlyDictionary<string, object>))]

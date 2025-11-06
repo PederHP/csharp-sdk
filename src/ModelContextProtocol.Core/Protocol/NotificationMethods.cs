@@ -32,11 +32,22 @@ public static class NotificationMethods
     /// </summary>
     /// <remarks>
     /// This notification informs clients that the set of available resources has been modified.
-    /// Changes may include resources being added, removed, or updated. Upon receiving this 
-    /// notification, clients may refresh their resource list by calling the appropriate 
+    /// Changes may include resources being added, removed, or updated. Upon receiving this
+    /// notification, clients may refresh their resource list by calling the appropriate
     /// method to get the updated list of resources.
     /// </remarks>
     public const string ResourceListChangedNotification = "notifications/resources/list_changed";
+
+    /// <summary>
+    /// The name of the notification sent by the server when the list of available interceptors changes.
+    /// </summary>
+    /// <remarks>
+    /// This notification informs clients that the set of available interceptors has been modified.
+    /// Changes may include interceptors being added, removed, or updated. Upon receiving this
+    /// notification, clients may refresh their interceptor list by calling the appropriate
+    /// method to get the updated list of interceptors.
+    /// </remarks>
+    public const string InterceptorListChangedNotification = "notifications/interceptors/list_changed";
 
     /// <summary>
     /// The name of the notification sent by the server when a resource is updated.

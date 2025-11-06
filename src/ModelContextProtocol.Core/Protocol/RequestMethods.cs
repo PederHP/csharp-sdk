@@ -111,4 +111,31 @@ public static class RequestMethods
     /// and information, establishing the protocol version and available features for the session.
     /// </remarks>
     public const string Initialize = "initialize";
+
+    /// <summary>
+    /// The name of the request method sent from the client to request a list of the server's interceptors.
+    /// </summary>
+    /// <remarks>
+    /// Interceptors provide validation, mutation, and observability capabilities for MCP operations.
+    /// Clients can discover available interceptors and invoke them to process requests and responses.
+    /// </remarks>
+    public const string InterceptorsList = "interceptors/list";
+
+    /// <summary>
+    /// The name of the request method sent from the client to invoke a single interceptor.
+    /// </summary>
+    /// <remarks>
+    /// This method allows clients to execute a specific interceptor on a payload,
+    /// receiving validation results, mutated payloads, or observability metadata depending on the interceptor type.
+    /// </remarks>
+    public const string InterceptorInvoke = "interceptor/invoke";
+
+    /// <summary>
+    /// The name of the request method sent from the client to execute a chain of interceptors.
+    /// </summary>
+    /// <remarks>
+    /// This method allows clients to execute multiple interceptors in sequence according to their priority.
+    /// Mutation interceptors transform the payload sequentially, while validation interceptors can run in parallel.
+    /// </remarks>
+    public const string InterceptorExecuteChain = "interceptor/executeChain";
 }
