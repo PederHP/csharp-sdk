@@ -144,6 +144,32 @@ public class McpClientToolTests : ClientServerTestBase
                 Meta = new JsonObject { ["errorCode"] = 500 }
             };
 
+        // Tool that returns CallToolResult with StructuredContent alongside image content
+        [McpServerTool]
+        public static CallToolResult StructuredContentWithImageTool() =>
+            new()
+            {
+                Content =
+                [
+                    new TextContentBlock { Text = "Chart rendered" },
+                    new ImageContentBlock { Data = System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(Encoding.UTF8.GetBytes("fake-chart-image"))), MimeType = "image/png" },
+                ],
+                StructuredContent = JsonElement.Parse("{\"width\":640,\"height\":480}")
+            };
+
+        // Tool that returns CallToolResult with IsError = true and image content
+        [McpServerTool]
+        public static CallToolResult ErrorWithImageTool() =>
+            new()
+            {
+                IsError = true,
+                Content =
+                [
+                    new TextContentBlock { Text = "Render failed; partial output attached" },
+                    new ImageContentBlock { Data = System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(Encoding.UTF8.GetBytes("partial-image"))), MimeType = "image/png" },
+                ]
+            };
+
         // Tool that returns binary resource (non-text)
         [McpServerTool]
         public static EmbeddedResourceBlock BinaryResourceTool() =>
@@ -381,7 +407,7 @@ public class McpClientToolTests : ClientServerTestBase
     }
 
     [Fact]
-    public async Task MixedWithNonConvertibleTool_ReturnsJsonElement()
+    public async Task MixedWithNonConvertibleTool_LiftsImageOutOfJsonEnvelope()
     {
         await using McpClient client = await CreateMcpClientForServer();
         var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
@@ -389,18 +415,77 @@ public class McpClientToolTests : ClientServerTestBase
 
         var result = await tool.InvokeAsync(cancellationToken: TestContext.Current.CancellationToken);
 
-        var jsonElement = Assert.IsType<JsonElement>(result);
-        Assert.True(jsonElement.TryGetProperty("content", out var contentArray));
-        Assert.Equal(JsonValueKind.Array, contentArray.ValueKind);
-        Assert.Equal(2, contentArray.GetArrayLength());
+        // The resource link can't be converted to AIContent, so the result falls back to the JSON
+        // envelope — but the image must not be embedded in it as base64 text.
+        var aiContents = Assert.IsType<AIContent[]>(result);
+        Assert.Equal(2, aiContents.Length);
 
-        var firstContent = contentArray[0];
-        Assert.True(firstContent.TryGetProperty("type", out var type1));
-        Assert.Equal("image", type1.GetString());
+        var envelopeText = Assert.IsType<TextContent>(aiContents[0]);
+        Assert.DoesNotContain(Convert.ToBase64String(Encoding.UTF8.GetBytes("image-data")), envelopeText.Text);
 
-        var secondContent = contentArray[1];
-        Assert.True(secondContent.TryGetProperty("type", out var type2));
-        Assert.Equal("resource_link", type2.GetString());
+        var envelope = JsonSerializer.Deserialize<CallToolResult>(envelopeText.Text, McpJsonUtilities.DefaultOptions);
+        Assert.NotNull(envelope);
+        Assert.Equal(2, envelope.Content.Count);
+        var placeholder = Assert.IsType<TextContentBlock>(envelope.Content[0]);
+        Assert.Contains("image/png", placeholder.Text);
+        var link = Assert.IsType<ResourceLinkBlock>(envelope.Content[1]);
+        Assert.Equal("file://linked.txt", link.Uri);
+
+        var dataContent = Assert.IsType<DataContent>(aiContents[1]);
+        Assert.Equal("image/png", dataContent.MediaType);
+        Assert.Equal("image-data", Encoding.UTF8.GetString(dataContent.Data.ToArray()));
+    }
+
+    [Fact]
+    public async Task StructuredContentWithImageTool_LiftsImageOutOfJsonEnvelope()
+    {
+        await using McpClient client = await CreateMcpClientForServer();
+        var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
+        var tool = tools.Single(t => t.Name == "structured_content_with_image_tool");
+
+        var result = await tool.InvokeAsync(cancellationToken: TestContext.Current.CancellationToken);
+
+        var aiContents = Assert.IsType<AIContent[]>(result);
+        Assert.Equal(2, aiContents.Length);
+
+        var envelopeText = Assert.IsType<TextContent>(aiContents[0]);
+        Assert.DoesNotContain(Convert.ToBase64String(Encoding.UTF8.GetBytes("fake-chart-image")), envelopeText.Text);
+
+        var envelope = JsonSerializer.Deserialize<CallToolResult>(envelopeText.Text, McpJsonUtilities.DefaultOptions);
+        Assert.NotNull(envelope);
+        Assert.NotNull(envelope.StructuredContent);
+        Assert.Equal(640, envelope.StructuredContent.Value.GetProperty("width").GetInt32());
+        Assert.Equal(2, envelope.Content.Count);
+        Assert.Equal("Chart rendered", Assert.IsType<TextContentBlock>(envelope.Content[0]).Text);
+        var placeholder = Assert.IsType<TextContentBlock>(envelope.Content[1]);
+        Assert.Contains("image/png", placeholder.Text);
+
+        var dataContent = Assert.IsType<DataContent>(aiContents[1]);
+        Assert.Equal("image/png", dataContent.MediaType);
+        Assert.Equal("fake-chart-image", Encoding.UTF8.GetString(dataContent.Data.ToArray()));
+    }
+
+    [Fact]
+    public async Task ErrorWithImageTool_LiftsImageOutOfJsonEnvelope()
+    {
+        await using McpClient client = await CreateMcpClientForServer();
+        var tools = await client.ListToolsAsync(cancellationToken: TestContext.Current.CancellationToken);
+        var tool = tools.Single(t => t.Name == "error_with_image_tool");
+
+        var result = await tool.InvokeAsync(cancellationToken: TestContext.Current.CancellationToken);
+
+        var aiContents = Assert.IsType<AIContent[]>(result);
+        Assert.Equal(2, aiContents.Length);
+
+        var envelopeText = Assert.IsType<TextContent>(aiContents[0]);
+        var envelope = JsonSerializer.Deserialize<CallToolResult>(envelopeText.Text, McpJsonUtilities.DefaultOptions);
+        Assert.NotNull(envelope);
+        Assert.True(envelope.IsError);
+        Assert.Equal("Render failed; partial output attached", Assert.IsType<TextContentBlock>(envelope.Content[0]).Text);
+
+        var dataContent = Assert.IsType<DataContent>(aiContents[1]);
+        Assert.Equal("image/png", dataContent.MediaType);
+        Assert.Equal("partial-image", Encoding.UTF8.GetString(dataContent.Data.ToArray()));
     }
 
     [Fact]

@@ -147,7 +147,70 @@ public sealed class McpClientTool : AIFunction
             }
         }
 
+        // We're falling back to returning the serialized CallToolResult. If its content includes binary
+        // data (images, audio, blob resources), embedding that data as base64 text inside the JSON both
+        // prevents downstream IChatClients from handling it as multi-modal content and can inflate prompt
+        // token consumption by orders of magnitude relative to native media handling. Lift the binary
+        // content out, returning it as AIContent alongside a text rendering of the remaining envelope.
+        if (LiftBinaryContentFromEnvelope(result) is { } envelopeWithBinaryContent)
+        {
+            return envelopeWithBinaryContent;
+        }
+
         return JsonSerializer.SerializeToElement(result, McpJsonUtilities.JsonContext.Default.CallToolResult);
+    }
+
+    /// <summary>
+    /// Extracts binary content blocks from a <see cref="CallToolResult"/> that is about to be returned as its
+    /// serialized JSON envelope. Each binary block is replaced in the envelope by a placeholder
+    /// <see cref="TextContentBlock"/> and returned as a <see cref="DataContent"/> following a
+    /// <see cref="TextContent"/> carrying the envelope JSON, so that no information is lost while the binary
+    /// data remains available to downstream consumers as multi-modal content.
+    /// </summary>
+    /// <returns>
+    /// The envelope text plus the extracted <see cref="DataContent"/> instances in content order, or
+    /// <see langword="null"/> if the result contains no binary content blocks (in which case the caller
+    /// should return the serialized <see cref="CallToolResult"/> as-is).
+    /// </returns>
+    private AIContent[]? LiftBinaryContentFromEnvelope(CallToolResult result)
+    {
+        List<AIContent>? binaryContents = null;
+        List<ContentBlock>? envelopeBlocks = null;
+
+        IList<ContentBlock> content = result.Content;
+        for (int i = 0; i < content.Count; i++)
+        {
+            if (content[i].ToAIContent(JsonSerializerOptions) is DataContent dataContent)
+            {
+                binaryContents ??= [];
+                envelopeBlocks ??= [.. content];
+
+                envelopeBlocks[i] = new TextContentBlock
+                {
+                    Text = $"(Binary content ({dataContent.MediaType}) omitted from this JSON and delivered as an additional content item of this tool result.)",
+                };
+                binaryContents.Add(dataContent);
+            }
+        }
+
+        if (binaryContents is null)
+        {
+            return null;
+        }
+
+        CallToolResult envelope = new()
+        {
+            Content = envelopeBlocks!,
+            StructuredContent = result.StructuredContent,
+            IsError = result.IsError,
+            Meta = result.Meta,
+        };
+
+        return
+        [
+            new TextContent(JsonSerializer.Serialize(envelope, McpJsonUtilities.JsonContext.Default.CallToolResult)),
+            .. binaryContents,
+        ];
     }
 
     private static bool HasApplicationResultMetadata(JsonObject? meta)
