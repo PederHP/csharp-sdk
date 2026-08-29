@@ -85,7 +85,9 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
     // request cannot be satisfied by its token, so it waits for the flow to settle and then runs its
     // own step-up; at most one interactive flow is ever presented to the user at a time. The flow
     // itself is bounded by the authorization callback handler's own completion and canceled on
-    // provider disposal.
+    // provider disposal. Because it outlives the lock, it carries its own snapshot of the client
+    // credentials (see ClientCredentials) rather than reading the mutable fields a later challenge may
+    // rebind for another authorization server while it is pending.
     private Task<string>? _inFlightAuthorizationCodeFlow;
     private HashSet<string>? _inFlightAuthorizationCodeFlowScopes;
     private readonly CancellationTokenSource _disposeCts = new();
@@ -785,6 +787,8 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
 
     private async Task<string?> RefreshTokensAsync(string refreshToken, string? resourceUri, AuthorizationServerMetadata authServerMetadata, CancellationToken cancellationToken)
     {
+        var credentials = CaptureClientCredentials();
+
         Dictionary<string, string> formFields = new()
         {
             ["grant_type"] = "refresh_token",
@@ -796,7 +800,7 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
             formFields["resource"] = resourceUri;
         }
 
-        using var request = CreateTokenRequest(authServerMetadata.TokenEndpoint, formFields);
+        using var request = CreateTokenRequest(authServerMetadata.TokenEndpoint, formFields, credentials);
 
         using var httpResponse = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
 
@@ -805,7 +809,7 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
             return null;
         }
 
-        var tokens = await HandleSuccessfulTokenResponseAsync(httpResponse, cancellationToken).ConfigureAwait(false);
+        var tokens = await HandleSuccessfulTokenResponseAsync(httpResponse, credentials, cancellationToken).ConfigureAwait(false);
         LogOAuthTokenRefreshCompleted();
         return tokens.AccessToken;
     }
@@ -819,6 +823,9 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         AuthorizationServerMetadata authServerMetadata,
         CancellationToken cancellationToken)
     {
+        // The flow outlives this lock scope, so it works from a snapshot of the client credentials
+        // rather than the mutable fields; see the _inFlightAuthorizationCodeFlow comment.
+        var credentials = CaptureClientCredentials();
         var codeVerifier = GenerateRandomBase64UrlValue();
         var codeChallenge = GenerateCodeChallenge(codeVerifier);
         var state = GenerateRandomBase64UrlValue();
@@ -827,15 +834,16 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         // placed in the URL, which offline_access augmentation and any ScopeSelector can make differ
         // from _accumulatedScopes.
         var scope = ComputeEffectiveScope(protectedResourceMetadata, authServerMetadata);
-        var authUrl = BuildAuthorizationUrl(protectedResourceMetadata, authServerMetadata, codeChallenge, state, scope);
+        var authUrl = BuildAuthorizationUrl(protectedResourceMetadata, authServerMetadata, credentials.ClientId, codeChallenge, state, scope);
         _inFlightAuthorizationCodeFlowScopes = new HashSet<string>(scope is null ? [] : SplitScopes(scope), StringComparer.Ordinal);
 
-        return CompleteAuthorizationCodeFlowAsync(protectedResourceMetadata, authServerMetadata, authUrl, state, codeVerifier, cancellationToken);
+        return CompleteAuthorizationCodeFlowAsync(protectedResourceMetadata, authServerMetadata, credentials, authUrl, state, codeVerifier, cancellationToken);
     }
 
     private async Task<string> CompleteAuthorizationCodeFlowAsync(
         ProtectedResourceMetadata protectedResourceMetadata,
         AuthorizationServerMetadata authServerMetadata,
+        ClientCredentials credentials,
         Uri authUrl,
         string state,
         string codeVerifier,
@@ -872,6 +880,7 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         return await ExchangeCodeForTokenAsync(
             protectedResourceMetadata,
             authServerMetadata,
+            credentials,
             authResult.Code!,
             codeVerifier,
             cancellationToken).ConfigureAwait(false);
@@ -880,6 +889,7 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
     private Uri BuildAuthorizationUrl(
         ProtectedResourceMetadata protectedResourceMetadata,
         AuthorizationServerMetadata authServerMetadata,
+        string clientId,
         string codeChallenge,
         string state,
         string? scope)
@@ -888,7 +898,7 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
 
         var queryParamsDictionary = new Dictionary<string, string>
         {
-            ["client_id"] = GetClientIdOrThrow(),
+            ["client_id"] = clientId,
             ["redirect_uri"] = _redirectUri.ToString(),
             ["response_type"] = "code",
             ["code_challenge"] = codeChallenge,
@@ -929,6 +939,7 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
     private async Task<string> ExchangeCodeForTokenAsync(
         ProtectedResourceMetadata protectedResourceMetadata,
         AuthorizationServerMetadata authServerMetadata,
+        ClientCredentials credentials,
         string authorizationCode,
         string codeVerifier,
         CancellationToken cancellationToken)
@@ -948,33 +959,45 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
             formFields["resource"] = resourceUri;
         }
 
-        using var request = CreateTokenRequest(authServerMetadata.TokenEndpoint, formFields);
+        using var request = CreateTokenRequest(authServerMetadata.TokenEndpoint, formFields, credentials);
 
         using var httpResponse = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         await httpResponse.EnsureSuccessStatusCodeWithResponseBodyAsync(cancellationToken).ConfigureAwait(false);
 
-        var tokens = await HandleSuccessfulTokenResponseAsync(httpResponse, cancellationToken).ConfigureAwait(false);
+        var tokens = await HandleSuccessfulTokenResponseAsync(httpResponse, credentials, cancellationToken).ConfigureAwait(false);
         LogOAuthAuthorizationCompleted();
         return tokens.AccessToken;
     }
 
     /// <summary>
-    /// Creates an HTTP request to the token endpoint, applying the appropriate authentication
-    /// method based on <see cref="_tokenEndpointAuthMethod"/>.
+    /// The client registration a token request is made with and persisted alongside the tokens it yields.
+    /// Captured under <c>_tokenAcquisitionLock</c> via <see cref="CaptureClientCredentials"/> so that work
+    /// which outlives the lock, such as a detached authorization-code flow, is unaffected by a later
+    /// challenge rebinding the provider's mutable credential fields to another authorization server.
     /// </summary>
-    private HttpRequestMessage CreateTokenRequest(Uri tokenEndpoint, Dictionary<string, string> formFields)
+    private sealed record ClientCredentials(string ClientId, string? ClientSecret, string? TokenEndpointAuthMethod, string? AuthorizationServer);
+
+    /// <summary>Snapshots the current client registration. Callers must hold <c>_tokenAcquisitionLock</c>.</summary>
+    private ClientCredentials CaptureClientCredentials() =>
+        new(GetClientIdOrThrow(), _clientSecret, _tokenEndpointAuthMethod, _clientCredentialsAuthorizationServer);
+
+    /// <summary>
+    /// Creates an HTTP request to the token endpoint, applying the appropriate authentication
+    /// method based on <see cref="ClientCredentials.TokenEndpointAuthMethod"/>.
+    /// </summary>
+    private HttpRequestMessage CreateTokenRequest(Uri tokenEndpoint, Dictionary<string, string> formFields, ClientCredentials credentials)
     {
         HttpRequestMessage request = new(HttpMethod.Post, tokenEndpoint);
 
-        var clientId = GetClientIdOrThrow();
-        if (string.Equals(_tokenEndpointAuthMethod, "client_secret_basic", StringComparison.Ordinal))
+        var clientId = credentials.ClientId;
+        if (string.Equals(credentials.TokenEndpointAuthMethod, "client_secret_basic", StringComparison.Ordinal))
         {
             // Per RFC 6749 §2.3.1: send client_id:client_secret as HTTP Basic auth.
             request.Headers.Authorization = new(
                 "Basic",
-                Convert.ToBase64String(Encoding.UTF8.GetBytes($"{Uri.EscapeDataString(clientId)}:{Uri.EscapeDataString(_clientSecret ?? string.Empty)}")));
+                Convert.ToBase64String(Encoding.UTF8.GetBytes($"{Uri.EscapeDataString(clientId)}:{Uri.EscapeDataString(credentials.ClientSecret ?? string.Empty)}")));
         }
-        else if (string.Equals(_tokenEndpointAuthMethod, "none", StringComparison.Ordinal))
+        else if (string.Equals(credentials.TokenEndpointAuthMethod, "none", StringComparison.Ordinal))
         {
             // Public client: include client_id in the body but no secret.
             formFields["client_id"] = clientId;
@@ -983,14 +1006,14 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         {
             // Default to client_secret_post: include credentials in the body.
             formFields["client_id"] = clientId;
-            formFields["client_secret"] = _clientSecret ?? string.Empty;
+            formFields["client_secret"] = credentials.ClientSecret ?? string.Empty;
         }
 
         request.Content = new FormUrlEncodedContent(formFields);
         return request;
     }
 
-    private async Task<TokenContainer> HandleSuccessfulTokenResponseAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    private async Task<TokenContainer> HandleSuccessfulTokenResponseAsync(HttpResponseMessage response, ClientCredentials credentials, CancellationToken cancellationToken)
     {
         using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         var tokenResponse = await JsonSerializer.DeserializeAsync(stream, McpJsonUtilities.JsonContext.Default.TokenResponse, cancellationToken).ConfigureAwait(false);
@@ -1015,10 +1038,10 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
             ObtainedAt = DateTimeOffset.UtcNow,
             // Persist the client registration alongside the tokens so a durable cache can use the
             // refresh token after a process restart without re-running dynamic client registration.
-            ClientId = _clientId,
-            ClientSecret = _clientSecret,
-            TokenEndpointAuthMethod = _tokenEndpointAuthMethod,
-            AuthorizationServer = _clientCredentialsAuthorizationServer,
+            ClientId = credentials.ClientId,
+            ClientSecret = credentials.ClientSecret,
+            TokenEndpointAuthMethod = credentials.TokenEndpointAuthMethod,
+            AuthorizationServer = credentials.AuthorizationServer,
         };
 
         await _tokenCache.StoreTokensAsync(tokens, cancellationToken).ConfigureAwait(false);
