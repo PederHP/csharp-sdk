@@ -417,6 +417,15 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
                     return steppedUpToken.AccessToken;
                 }
 
+                // The step-up that already requested these scopes may still be pending: the request
+                // that started it was canceled while the user was completing it. Its outcome is what
+                // will satisfy this challenge, so join it rather than reject the challenge as repeated.
+                if (_inFlightAuthorizationCodeFlow is { IsCompleted: false } pendingStepUp &&
+                    InFlightAuthorizationCodeFlowCoversChallenge(protectedResourceMetadata))
+                {
+                    return await pendingStepUp.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+
                 ThrowFailedToHandleUnauthorizedResponse(
                     "A repeated insufficient_scope challenge added no scope beyond those already requested, " +
                     "so step-up authorization cannot satisfy the request.");

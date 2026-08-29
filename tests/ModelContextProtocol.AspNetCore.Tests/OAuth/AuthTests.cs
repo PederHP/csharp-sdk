@@ -2822,6 +2822,131 @@ public class AuthTests : OAuthTestBase
     }
 
     [Fact]
+    public async Task InteractiveAuthorization_RepeatedChallengeForSameScopes_JoinsPendingStepUp()
+    {
+        // A step-up abandoned by its caller (canceled while the user is mid-login) is still pending.
+        // Another request challenged for the same scopes must join that flow instead of being rejected
+        // as an unproductive repeated step-up: the pending flow is exactly what will satisfy it.
+        Builder.Services.AddMcpServer()
+            .WithTools([
+                McpServerTool.Create([McpServerTool(Name = "read-tool")]
+                (ClaimsPrincipal user) =>
+                {
+                    return "Read tool executed.";
+                }),
+            ]);
+
+        var readChallengesRaised = 0;
+        var secondChallengeBeingHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var app = await StartMcpServerAsync(configureMiddleware: app =>
+        {
+            // Fetching the protected resource metadata is the client's first step in handling a
+            // challenge. The authentication handler serves that document itself, so this observer must
+            // sit ahead of the authentication middleware (added explicitly below rather than
+            // auto-inserted at the front of the pipeline), while the challenge middleware below it
+            // needs the authenticated user.
+            app.Use(async (context, next) =>
+            {
+                if (context.Request.Path == "/.well-known/oauth-protected-resource" && Volatile.Read(ref readChallengesRaised) == 2)
+                {
+                    secondChallengeBeingHandled.TrySetResult();
+                }
+
+                await next(context);
+            });
+
+            app.UseAuthentication();
+            app.UseAuthorization();
+
+            app.Use(async (context, next) =>
+            {
+                if (context.Request.Method == HttpMethods.Post && context.Request.Path == "/")
+                {
+                    context.Request.EnableBuffering();
+
+                    var message = await JsonSerializer.DeserializeAsync(
+                        context.Request.Body,
+                        McpJsonUtilities.DefaultOptions.GetTypeInfo(typeof(JsonRpcMessage)),
+                        context.RequestAborted) as JsonRpcMessage;
+
+                    context.Request.Body.Position = 0;
+
+                    if (message is JsonRpcRequest request && request.Method == "tools/call")
+                    {
+                        var toolCallParams = JsonSerializer.Deserialize(
+                            request.Params,
+                            McpJsonUtilities.DefaultOptions.GetTypeInfo(typeof(CallToolRequestParams))) as CallToolRequestParams;
+
+                        var scopeClaim = context.User.FindFirst("scope")?.Value ?? "";
+                        var scopeSet = new HashSet<string>(scopeClaim.Split(' '));
+
+                        if (toolCallParams?.Name == "read-tool" && !scopeSet.Contains("files:read"))
+                        {
+                            // Counted before the response goes out so the observer above sees it when
+                            // the client's metadata fetch arrives.
+                            Interlocked.Increment(ref readChallengesRaised);
+
+                            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                            context.Response.Headers.WWWAuthenticate = $"Bearer error=\"insufficient_scope\", resource_metadata=\"{McpServerUrl}/.well-known/oauth-protected-resource\", scope=\"files:read\"";
+                            await context.Response.StartAsync(context.RequestAborted);
+                            await context.Response.Body.FlushAsync(context.RequestAborted);
+                            return;
+                        }
+                    }
+                }
+
+                await next(context);
+            });
+        });
+
+        List<string> requestedScopes = [];
+        var stepUpEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completeStepUp = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var transport = CreateOAuthTransport(async (context, cancellationToken) =>
+        {
+            int invocation;
+            lock (requestedScopes)
+            {
+                requestedScopes.Add(QueryHelpers.ParseQuery(context.AuthorizationUri.Query)["scope"].ToString());
+                invocation = requestedScopes.Count;
+            }
+
+            if (invocation == 2)
+            {
+                // The step-up: hold it open, like a user mid-login.
+                stepUpEntered.TrySetResult();
+                await completeStepUp.Task.WaitAsync(cancellationToken);
+            }
+
+            return await HandleAuthorizationUrlAsync(context, cancellationToken);
+        });
+
+        await using var client = await McpClient.CreateAsync(
+            transport, loggerFactory: LoggerFactory, cancellationToken: TestContext.Current.CancellationToken);
+
+        // The first read-tool call is canceled while its step-up waits on the user, leaving it pending.
+        using var firstCallCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var firstCall = client.CallToolAsync("read-tool", cancellationToken: firstCallCts.Token).AsTask();
+        await stepUpEntered.Task.WaitAsync(TestContext.Current.CancellationToken);
+        firstCallCts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => firstCall);
+
+        // The second call draws the same challenge and starts handling it while the step-up is still
+        // pending; only then does the user complete the step-up.
+        var secondCall = client.CallToolAsync("read-tool", cancellationToken: TestContext.Current.CancellationToken).AsTask();
+        await secondChallengeBeingHandled.Task.WaitAsync(TestContext.Current.CancellationToken);
+        completeStepUp.TrySetResult();
+
+        var result = await secondCall;
+        Assert.Equal("Read tool executed.", result.Content[0].ToString());
+
+        // Two prompts in total: the initial connect and the single step-up both calls shared.
+        Assert.Equal(["mcp:tools", "files:read mcp:tools"], requestedScopes);
+    }
+
+    [Fact]
     public async Task DisposingTransport_CancelsDetachedAuthorizationFlow()
     {
         await using var app = await StartMcpServerAsync();
