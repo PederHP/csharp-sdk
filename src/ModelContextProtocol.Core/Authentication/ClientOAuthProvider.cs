@@ -73,17 +73,21 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
     private readonly HashSet<string> _accumulatedScopes = new(StringComparer.Ordinal);
     private bool _hasAttemptedStepUp;
 
-    // The single in-flight authorization-code flow, if any. Written only while holding
-    // _tokenAcquisitionLock. The flow is deliberately detached from the cancellation of the request
-    // whose challenge started it: the user may already be completing the authorization in a browser,
-    // and canceling one HTTP request — for example a server/discover probe canceled by
+    // The single in-flight authorization-code flow, if any, and the scopes it requested. Written only
+    // while holding _tokenAcquisitionLock. The flow is deliberately detached from the cancellation of
+    // the request whose challenge started it: the user may already be completing the authorization in
+    // a browser, and canceling one HTTP request — for example a server/discover probe canceled by
     // McpClientOptions.DiscoverProbeTimeout during the dual-path connect — must not abort that flow.
     // If it did, the next challenge would start a second flow with a fresh state and PKCE verifier
     // that the redirect the user eventually completes can never satisfy. Instead, a later challenge
-    // joins the in-flight flow and shares its result, while each caller observes its own cancellation
-    // via WaitAsync. The flow itself is bounded by the authorization callback handler's own
-    // completion and canceled on provider disposal.
+    // whose scopes the flow already requested joins it and shares its result, while each caller
+    // observes its own cancellation via WaitAsync. A challenge that needs a scope the flow did not
+    // request cannot be satisfied by its token, so it waits for the flow to settle and then runs its
+    // own step-up; at most one interactive flow is ever presented to the user at a time. The flow
+    // itself is bounded by the authorization callback handler's own completion and canceled on
+    // provider disposal.
     private Task<string>? _inFlightAuthorizationCodeFlow;
+    private HashSet<string>? _inFlightAuthorizationCodeFlowScopes;
     private readonly CancellationTokenSource _disposeCts = new();
     private int _disposed;
 
@@ -506,16 +510,50 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         // Store auth server metadata for future refresh operations
         _authServerMetadata = authServerMetadata;
 
-        // Perform the OAuth flow. A caller that reaches this point after a previous caller's request
-        // was canceled mid-flow (releasing the lock with the flow still pending) joins the in-flight
-        // flow instead of starting a competing one; see the _inFlightAuthorizationCodeFlow comment.
+        // Perform the OAuth flow. A caller that reaches this point while a previous caller's flow is
+        // still pending (that caller's request was canceled mid-flow, releasing the lock) joins the
+        // in-flight flow instead of starting a competing one, provided the flow requested every scope
+        // this challenge needs; see the _inFlightAuthorizationCodeFlow comment.
         var flow = _inFlightAuthorizationCodeFlow;
+        if (flow is { IsCompleted: false } && !InFlightAuthorizationCodeFlowCoversChallenge(protectedResourceMetadata))
+        {
+            // The pending flow's token cannot satisfy this challenge, but two interactive flows must
+            // never be presented at once, so let it settle first. Its outcome, success or failure, is
+            // reported to the callers that joined it and is irrelevant here (Task.WhenAny never
+            // faults); this challenge then runs its own step-up for the accumulated scopes.
+            await Task.WhenAny(flow).WaitAsync(cancellationToken).ConfigureAwait(false);
+            flow = null;
+        }
+
         if (flow is null || flow.IsCompleted)
         {
-            _inFlightAuthorizationCodeFlow = flow = InitiateAuthorizationCodeFlowAsync(protectedResourceMetadata, authServerMetadata, _disposeCts.Token);
+            _inFlightAuthorizationCodeFlow = flow = StartAuthorizationCodeFlow(protectedResourceMetadata, authServerMetadata, _disposeCts.Token);
         }
 
         return await flow.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Returns whether the in-flight authorization-code flow requested every scope the current challenge
+    /// requires, so that joining it can satisfy the challenge. A challenge that names no concrete scope is
+    /// satisfied by whatever token the flow yields.
+    /// </summary>
+    private bool InFlightAuthorizationCodeFlowCoversChallenge(ProtectedResourceMetadata protectedResourceMetadata)
+    {
+        if (_inFlightAuthorizationCodeFlowScopes is not { } requestedScopes)
+        {
+            return false;
+        }
+
+        foreach (var scope in GetCurrentOperationScopes(protectedResourceMetadata))
+        {
+            if (!requestedScopes.Contains(scope))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void ApplyClientIdMetadataDocument(Uri metadataUri)
@@ -732,7 +770,11 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         return tokens.AccessToken;
     }
 
-    private async Task<string> InitiateAuthorizationCodeFlowAsync(
+    /// <summary>
+    /// Starts an authorization-code flow for the current challenge and records the scopes it requests in
+    /// <see cref="_inFlightAuthorizationCodeFlowScopes"/>. Callers must hold <c>_tokenAcquisitionLock</c>.
+    /// </summary>
+    private Task<string> StartAuthorizationCodeFlow(
         ProtectedResourceMetadata protectedResourceMetadata,
         AuthorizationServerMetadata authServerMetadata,
         CancellationToken cancellationToken)
@@ -741,8 +783,22 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         var codeChallenge = GenerateCodeChallenge(codeVerifier);
         var state = GenerateRandomBase64UrlValue();
 
+        // Building the URL folds this challenge's scopes into _accumulatedScopes, so the accumulated set
+        // is now exactly the set of scopes this flow asks the authorization server for.
         var authUrl = BuildAuthorizationUrl(protectedResourceMetadata, authServerMetadata, codeChallenge, state);
+        _inFlightAuthorizationCodeFlowScopes = new HashSet<string>(_accumulatedScopes, StringComparer.Ordinal);
 
+        return CompleteAuthorizationCodeFlowAsync(protectedResourceMetadata, authServerMetadata, authUrl, state, codeVerifier, cancellationToken);
+    }
+
+    private async Task<string> CompleteAuthorizationCodeFlowAsync(
+        ProtectedResourceMetadata protectedResourceMetadata,
+        AuthorizationServerMetadata authServerMetadata,
+        Uri authUrl,
+        string state,
+        string codeVerifier,
+        CancellationToken cancellationToken)
+    {
         var authResult = await _authorizationCallbackHandler(
             new AuthorizationCallbackContext
             {

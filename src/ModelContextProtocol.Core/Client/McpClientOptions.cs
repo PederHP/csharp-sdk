@@ -91,9 +91,12 @@ public sealed class McpClientOptions
     /// </para>
     /// <para>
     /// When the transport authenticates via OAuth with an interactive
-    /// <see cref="Authentication.ClientOAuthOptions.AuthorizationCallbackHandler"/>, the user's browser-based
-    /// authorization runs within this budget: increase this value to cover the time a person
-    /// needs to complete the login, not just the network round-trips.
+    /// <see cref="Authentication.ClientOAuthOptions.AuthorizationCallbackHandler"/>, this timeout also bounds
+    /// how long the connect attempt waits for the user to complete the browser-based authorization, so
+    /// increase this value to cover the time a person needs to complete the login, not just the network
+    /// round-trips. Reaching it fails the connect attempt but does not cancel the authorization flow
+    /// itself: the flow keeps running so that a later challenge on the same transport reuses its outcome
+    /// rather than prompting the user again, and only disposing the transport cancels it.
     /// </para>
     /// </remarks>
     public TimeSpan InitializationTimeout { get; set; } = TimeSpan.FromSeconds(60);
