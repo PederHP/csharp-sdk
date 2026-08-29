@@ -2507,6 +2507,32 @@ public class AuthTests : OAuthTestBase
         Assert.False(scopePresent);
     }
 
+    /// <summary>
+    /// An in-memory token cache that signals when tokens are first stored and can model an authorization
+    /// server that issues no refresh token by discarding it.
+    /// </summary>
+    private sealed class SignalingTokenCache(bool discardRefreshTokens = false) : ITokenCache
+    {
+        private TokenContainer? _tokens;
+
+        public TaskCompletionSource TokensStored { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ValueTask StoreTokensAsync(TokenContainer tokens, CancellationToken cancellationToken)
+        {
+            if (discardRefreshTokens)
+            {
+                tokens.RefreshToken = null;
+            }
+
+            Volatile.Write(ref _tokens, tokens);
+            TokensStored.TrySetResult();
+            return default;
+        }
+
+        public ValueTask<TokenContainer?> GetTokensAsync(CancellationToken cancellationToken) =>
+            new(Volatile.Read(ref _tokens));
+    }
+
     private HttpClientTransport CreateOAuthTransport(
         Func<AuthorizationCallbackContext, CancellationToken, Task<ModelContextProtocol.Authentication.AuthorizationResult?>>?
             authorizationCallbackHandler = null) =>
@@ -2707,7 +2733,7 @@ public class AuthTests : OAuthTestBase
             // front of the pipeline), while the challenge middleware below it needs the authenticated user.
             app.Use(async (context, next) =>
             {
-                if (context.Request.Path == "/.well-known/oauth-protected-resource" && Volatile.Read(ref writeChallengeRaised) == 1)
+                if (context.Request.Path.StartsWithSegments("/.well-known/oauth-protected-resource") && Volatile.Read(ref writeChallengeRaised) == 1)
                 {
                     writeChallengeBeingHandled.TrySetResult();
                 }
@@ -2848,7 +2874,7 @@ public class AuthTests : OAuthTestBase
             // needs the authenticated user.
             app.Use(async (context, next) =>
             {
-                if (context.Request.Path == "/.well-known/oauth-protected-resource" && Volatile.Read(ref readChallengesRaised) == 2)
+                if (context.Request.Path.StartsWithSegments("/.well-known/oauth-protected-resource") && Volatile.Read(ref readChallengesRaised) == 2)
                 {
                     secondChallengeBeingHandled.TrySetResult();
                 }
@@ -2944,6 +2970,80 @@ public class AuthTests : OAuthTestBase
 
         // Two prompts in total: the initial connect and the single step-up both calls shared.
         Assert.Equal(["mcp:tools", "files:read mcp:tools"], requestedScopes);
+    }
+
+    [Fact]
+    public async Task InteractiveAuthorization_FlowCompletingDuringChallengeHandling_IsReusedNotRestarted()
+    {
+        // A detached flow can complete while a later challenge is already being handled, after that
+        // challenge re-checked the token cache on acquiring the lock but before it decides whether to
+        // join the flow. Its token must then be reused; starting a second flow would prompt the user
+        // again for a token that is already cached. With no refresh token available (the test
+        // authorization server always issues one, so the cache discards it), the cached access token
+        // is the only alternative to a second prompt.
+        var tokenCache = new SignalingTokenCache(discardRefreshTokens: true);
+        var handlerInvocations = 0;
+        var handlerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completeAuthorization = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondConnectStarted = 0;
+
+        await using var app = await StartMcpServerAsync(configureMiddleware: app =>
+        {
+            // Fetching the protected resource metadata is the client's first step in handling a
+            // challenge. The authentication handler serves that document itself, so this observer must
+            // sit ahead of the authentication middleware (added explicitly below rather than
+            // auto-inserted at the front of the pipeline). Once the second connect's challenge fetches
+            // it, the user completes the first connect's flow, and the response is held back until that
+            // flow has stored its token, so the challenge finds the flow completed when it decides.
+            app.Use(async (context, next) =>
+            {
+                if (context.Request.Path.StartsWithSegments("/.well-known/oauth-protected-resource") && Volatile.Read(ref secondConnectStarted) == 1)
+                {
+                    completeAuthorization.TrySetResult();
+                    await tokenCache.TokensStored.Task.WaitAsync(TestConstants.DefaultTimeout, context.RequestAborted);
+                }
+
+                await next(context);
+            });
+
+            app.UseAuthentication();
+            app.UseAuthorization();
+        });
+
+        await using var transport = new HttpClientTransport(new()
+        {
+            Endpoint = new(McpServerUrl),
+            OAuth = new()
+            {
+                ClientId = "demo-client",
+                ClientSecret = "demo-secret",
+                RedirectUri = new Uri("http://localhost:1179/callback"),
+                TokenCache = tokenCache,
+                AuthorizationCallbackHandler = async (context, cancellationToken) =>
+                {
+                    Interlocked.Increment(ref handlerInvocations);
+                    handlerEntered.TrySetResult();
+                    await completeAuthorization.Task.WaitAsync(cancellationToken);
+                    return await HandleAuthorizationUrlAsync(context, cancellationToken);
+                },
+            },
+        }, HttpClient, LoggerFactory);
+
+        var clientOptions = new McpClientOptions { ProtocolVersion = "2025-06-18" };
+
+        using var firstConnectCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var firstConnect = McpClient.CreateAsync(
+            transport, clientOptions, loggerFactory: LoggerFactory, cancellationToken: firstConnectCts.Token);
+
+        await handlerEntered.Task.WaitAsync(TestContext.Current.CancellationToken);
+        firstConnectCts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => firstConnect);
+
+        Volatile.Write(ref secondConnectStarted, 1);
+        await using var client = await McpClient.CreateAsync(
+            transport, clientOptions, loggerFactory: LoggerFactory, cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, handlerInvocations);
     }
 
     [Fact]

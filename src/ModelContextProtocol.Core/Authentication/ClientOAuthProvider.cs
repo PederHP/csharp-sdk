@@ -417,13 +417,13 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
                     return steppedUpToken.AccessToken;
                 }
 
-                // The step-up that already requested these scopes may still be pending: the request
-                // that started it was canceled while the user was completing it. Its outcome is what
-                // will satisfy this challenge, so join it rather than reject the challenge as repeated.
-                if (_inFlightAuthorizationCodeFlow is { IsCompleted: false } pendingStepUp &&
-                    InFlightAuthorizationCodeFlowCoversChallenge(protectedResourceMetadata))
+                // The step-up that already requested these scopes may still be pending (the request
+                // that started it was canceled while the user was completing it) or may have completed
+                // since the cache was read above. Either way its outcome is what satisfies this
+                // challenge, so reuse it rather than reject the challenge as repeated.
+                if (await TryReuseInFlightAuthorizationCodeFlowAsync(protectedResourceMetadata, usedAccessToken, cancellationToken).ConfigureAwait(false) is { } steppedUpAccessToken)
                 {
-                    return await pendingStepUp.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    return steppedUpAccessToken;
                 }
 
                 ThrowFailedToHandleUnauthorizedResponse(
@@ -519,27 +519,58 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         // Store auth server metadata for future refresh operations
         _authServerMetadata = authServerMetadata;
 
-        // Perform the OAuth flow. A caller that reaches this point while a previous caller's flow is
-        // still pending (that caller's request was canceled mid-flow, releasing the lock) joins the
-        // in-flight flow instead of starting a competing one, provided the flow requested every scope
-        // this challenge needs; see the _inFlightAuthorizationCodeFlow comment.
-        var flow = _inFlightAuthorizationCodeFlow;
-        if (flow is { IsCompleted: false } && !InFlightAuthorizationCodeFlowCoversChallenge(protectedResourceMetadata))
+        // Perform the OAuth flow, unless the in-flight flow already satisfies this challenge: a caller
+        // that reaches this point while a previous caller's flow is still pending (that caller's
+        // request was canceled mid-flow, releasing the lock) joins it instead of starting a competing
+        // one, and a flow that completed during the metadata work above has cached the token this
+        // challenge needs. See the _inFlightAuthorizationCodeFlow comment.
+        if (await TryReuseInFlightAuthorizationCodeFlowAsync(protectedResourceMetadata, usedAccessToken, cancellationToken).ConfigureAwait(false) is { } reusedAccessToken)
         {
-            // The pending flow's token cannot satisfy this challenge, but two interactive flows must
-            // never be presented at once, so let it settle first. Its outcome, success or failure, is
-            // reported to the callers that joined it and is irrelevant here (Task.WhenAny never
-            // faults); this challenge then runs its own step-up for the accumulated scopes.
-            await Task.WhenAny(flow).WaitAsync(cancellationToken).ConfigureAwait(false);
-            flow = null;
+            return reusedAccessToken;
         }
 
-        if (flow is null || flow.IsCompleted)
+        if (_inFlightAuthorizationCodeFlow is { IsCompleted: false } pendingFlow)
         {
-            _inFlightAuthorizationCodeFlow = flow = StartAuthorizationCodeFlow(protectedResourceMetadata, authServerMetadata, _disposeCts.Token);
+            // The pending flow did not request a scope this challenge needs, so its token cannot
+            // satisfy it, but two interactive flows must never be presented at once: let it settle
+            // first. Its outcome, success or failure, is reported to the callers that joined it and
+            // is irrelevant here (Task.WhenAny never faults).
+            await Task.WhenAny(pendingFlow).WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        var flow = _inFlightAuthorizationCodeFlow = StartAuthorizationCodeFlow(protectedResourceMetadata, authServerMetadata, _disposeCts.Token);
         return await flow.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Satisfies the current challenge from the in-flight authorization-code flow when that flow requested
+    /// every scope the challenge needs: joins the flow while it is pending, or reuses the token it cached
+    /// if it completed after the caller last consulted the cache. Returns <see langword="null"/> when there
+    /// is no such flow or nothing usable came of it, in which case the caller runs a flow of its own.
+    /// </summary>
+    private async Task<string?> TryReuseInFlightAuthorizationCodeFlowAsync(ProtectedResourceMetadata protectedResourceMetadata, string? usedAccessToken, CancellationToken cancellationToken)
+    {
+        if (_inFlightAuthorizationCodeFlow is not { } flow || !InFlightAuthorizationCodeFlowCoversChallenge(protectedResourceMetadata))
+        {
+            return null;
+        }
+
+        if (!flow.IsCompleted)
+        {
+            return await flow.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        // A flow that ran to completion stored its token, and a token other than the one this challenge
+        // rejected is worth retrying with. A flow that faulted or was canceled stored nothing, and a
+        // long-completed flow's token is the rejected one itself.
+        if (flow.Status == TaskStatus.RanToCompletion &&
+            await _tokenCache.GetTokensAsync(cancellationToken).ConfigureAwait(false) is { IsExpired: false } cached &&
+            !string.Equals(cached.AccessToken, usedAccessToken, StringComparison.Ordinal))
+        {
+            return cached.AccessToken;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -792,10 +823,12 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         var codeChallenge = GenerateCodeChallenge(codeVerifier);
         var state = GenerateRandomBase64UrlValue();
 
-        // Building the URL folds this challenge's scopes into _accumulatedScopes, so the accumulated set
-        // is now exactly the set of scopes this flow asks the authorization server for.
-        var authUrl = BuildAuthorizationUrl(protectedResourceMetadata, authServerMetadata, codeChallenge, state);
-        _inFlightAuthorizationCodeFlowScopes = new HashSet<string>(_accumulatedScopes, StringComparer.Ordinal);
+        // Record the scopes this flow actually asks the authorization server for: the effective scope
+        // placed in the URL, which offline_access augmentation and any ScopeSelector can make differ
+        // from _accumulatedScopes.
+        var scope = ComputeEffectiveScope(protectedResourceMetadata, authServerMetadata);
+        var authUrl = BuildAuthorizationUrl(protectedResourceMetadata, authServerMetadata, codeChallenge, state, scope);
+        _inFlightAuthorizationCodeFlowScopes = new HashSet<string>(scope is null ? [] : SplitScopes(scope), StringComparer.Ordinal);
 
         return CompleteAuthorizationCodeFlowAsync(protectedResourceMetadata, authServerMetadata, authUrl, state, codeVerifier, cancellationToken);
     }
@@ -848,7 +881,8 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
         ProtectedResourceMetadata protectedResourceMetadata,
         AuthorizationServerMetadata authServerMetadata,
         string codeChallenge,
-        string state)
+        string state,
+        string? scope)
     {
         var resourceUri = GetResourceUri(protectedResourceMetadata);
 
@@ -867,7 +901,6 @@ internal sealed partial class ClientOAuthProvider : McpHttpClient, IDisposable
             queryParamsDictionary["resource"] = resourceUri;
         }
 
-        var scope = ComputeEffectiveScope(protectedResourceMetadata, authServerMetadata);
         if (!string.IsNullOrEmpty(scope))
         {
             queryParamsDictionary["scope"] = scope!;
