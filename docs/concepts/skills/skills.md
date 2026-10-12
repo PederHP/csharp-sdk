@@ -259,7 +259,7 @@ Servers built with this package do not declare `directoryRead`, and hosts must n
 
 ### Samples
 
-- [SkillsServer](https://github.com/modelcontextprotocol/csharp-sdk/tree/ecb11e621b0ae46685314729a74c0cb8fe283d44/samples/SkillsServer): a Streamable
+- [SkillsServer](https://github.com/modelcontextprotocol/csharp-sdk/tree/main/samples/SkillsServer): a Streamable
   HTTP server serving two skills from directories on disk.
-- [SkillsClient](https://github.com/modelcontextprotocol/csharp-sdk/tree/ecb11e621b0ae46685314729a74c0cb8fe283d44/samples/SkillsClient): a client that
+- [SkillsClient](https://github.com/modelcontextprotocol/csharp-sdk/tree/main/samples/SkillsClient): a client that
   connects to it and discovers, retrieves, and verifies them.
